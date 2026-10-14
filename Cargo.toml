@@ -1,0 +1,39 @@
+[package]
+name = "open-room"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Independent room measurement and target-curve editor for macOS and NAD workflows"
+license = "MIT"
+
+[dependencies]
+bytes = "1"
+tonic = "0.12"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+cpal = "0.15"
+eframe = "0.29"
+egui_plot = "0.29"
+hound = "3"
+mdns-sd = "0.13"
+quick-xml = "0.37"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+rfd = "0.15"
+rustfft = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.5"
+block2 = "0.6.2"
+coreaudio-sys = "0.2.18"
+core-foundation = "0.9.4"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true

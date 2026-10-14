@@ -1,0 +1,10 @@
+/target/
+/dist/
+/work/
+.DS_Store
+*.openroom.json
+*.liveproject
+*.wav
+*.ogg
+.env
+.env.*
