@@ -3,6 +3,8 @@ pub mod audio;
 pub mod device;
 pub mod diracio;
 pub mod dsp;
+pub mod listening;
+pub mod measurement;
 #[cfg(target_os = "macos")]
 mod mac_audio;
 #[cfg(target_os = "macos")]

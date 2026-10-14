@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     io::Read,
-    net::{IpAddr, SocketAddr, UdpSocket},
+    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     time::{Duration, Instant},
 };
 
@@ -49,6 +49,7 @@ pub fn address(input: &str) -> Result<SocketAddr> {
 }
 fn get(addr: SocketAddr, path: &str) -> Result<String> {
     let client = reqwest::blocking::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(4))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
@@ -128,6 +129,63 @@ pub fn probe(input: &str) -> Result<Device> {
 }
 
 pub fn discover() -> Result<Vec<Device>> {
+    Ok(discover_report()?.devices)
+}
+
+#[derive(Debug)]
+pub struct DiscoveryReport {
+    pub devices: Vec<Device>,
+    pub warnings: Vec<String>,
+}
+
+/// Both discovery protocols run independently. A Bonjour failure must not prevent
+/// UPnP discovery, and failed identity probes are reported rather than hidden.
+pub fn discover_report() -> Result<DiscoveryReport> {
+    let (bonjour, upnp) = std::thread::scope(|scope| {
+        let bonjour = scope.spawn(discover_bonjour);
+        let upnp = scope.spawn(discover_upnp);
+        (bonjour.join(), upnp.join())
+    });
+    let mut addresses = BTreeMap::new();
+    let mut warnings = Vec::new();
+    let mut successful_searches = 0;
+    for (label, result) in [("Bonjour", bonjour), ("UPnP", upnp)] {
+        match result {
+            Ok(Ok(found)) => {
+                successful_searches += 1;
+                addresses.extend(found.into_iter().map(|a| (a, ())));
+            }
+            Ok(Err(e)) => warnings.push(format!("{label} discovery failed: {e:#}")),
+            Err(_) => warnings.push(format!("{label} discovery worker stopped unexpectedly")),
+        }
+    }
+    anyhow::ensure!(successful_searches > 0, "{}", warnings.join("\n"));
+    // Probe in parallel so an unrelated UPnP device cannot delay every player.
+    let results = std::thread::scope(|scope| {
+        let jobs: Vec<_> = addresses
+            .keys()
+            .take(32)
+            .map(|addr| {
+                let addr = *addr;
+                scope.spawn(move || (addr, probe(&addr.to_string())))
+            })
+            .collect();
+        jobs.into_iter().map(|job| job.join()).collect::<Vec<_>>()
+    });
+    let mut devices = Vec::new();
+    for result in results {
+        match result {
+            Ok((_, Ok(device))) => devices.push(device),
+            Ok((addr, Err(e))) => {
+                warnings.push(format!("No readable BluOS identity at {addr}: {e:#}"))
+            }
+            Err(_) => warnings.push("Player identity worker stopped unexpectedly".into()),
+        }
+    }
+    Ok(DiscoveryReport { devices, warnings })
+}
+
+fn discover_bonjour() -> Result<Vec<SocketAddr>> {
     let daemon = ServiceDaemon::new()?;
     let mut receivers = Vec::new();
     for ty in ["_musc._tcp.local.", "_musp._tcp.local."] {
@@ -154,13 +212,118 @@ pub fn discover() -> Result<Vec<Device>> {
         let _ = daemon.stop_browse(ty);
     }
     let _ = daemon.shutdown();
-    let mut found = Vec::new();
-    for addr in addresses.keys().take(32) {
-        if let Ok(d) = probe(&addr.to_string()) {
-            found.push(d)
+    Ok(addresses.into_keys().collect())
+}
+
+const ROOT_SEARCH: &[u8] = b"M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 4\r\nST: upnp:rootdevice\r\n\r\n";
+
+/// Search each local IPv4 interface; responses go to our ephemeral source port.
+/// Device.xml's port describes UPnP, not the BluOS identity API on port 11000.
+fn discover_upnp() -> Result<Vec<SocketAddr>> {
+    let ips: std::collections::BTreeSet<_> = if_addrs::get_if_addrs()?
+        .into_iter()
+        .filter_map(|interface| match interface.ip() {
+            IpAddr::V4(ip) if !ip.is_loopback() && (ip.is_private() || ip.is_link_local()) => {
+                Some(ip)
+            }
+            _ => None,
+        })
+        .collect();
+    let destination = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 255, 250)), 1900);
+    let mut sockets = Vec::new();
+    let mut failures = Vec::new();
+    for ip in ips {
+        let result = (|| -> Result<UdpSocket> {
+            let socket = UdpSocket::bind((ip, 0))?;
+            socket.set_nonblocking(true)?;
+            socket.set_multicast_ttl_v4(2)?;
+            socket2::SockRef::from(&socket).set_multicast_if_v4(&ip)?;
+            socket.send_to(ROOT_SEARCH, destination)?;
+            Ok(socket)
+        })();
+        match result {
+            Ok(socket) => sockets.push(socket),
+            Err(e) => failures.push(format!("{ip}: {e:#}")),
         }
     }
-    Ok(found)
+    anyhow::ensure!(
+        !sockets.is_empty(),
+        "No usable local IPv4 interface for UPnP. {}",
+        failures.join("; ")
+    );
+    collect_upnp(&sockets, Duration::from_secs(6))
+}
+
+fn collect_upnp(sockets: &[UdpSocket], duration: Duration) -> Result<Vec<SocketAddr>> {
+    let until = Instant::now() + duration;
+    let mut addresses = BTreeMap::new();
+    let mut buffer = [0; 8192];
+    while Instant::now() < until {
+        for socket in sockets {
+            // Bound processing as well as elapsed time on noisy networks.
+            for _ in 0..64 {
+                match socket.recv_from(&mut buffer) {
+                    Ok((n, from)) => {
+                        if let Ok(candidate) = upnp_candidate(&buffer[..n], from) {
+                            if addresses.len() < 32 {
+                                addresses.insert(candidate, ());
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Ok(addresses.into_keys().collect())
+}
+
+fn upnp_candidate(response: &[u8], from: SocketAddr) -> Result<SocketAddr> {
+    let response = std::str::from_utf8(response)?;
+    let mut lines = response.lines();
+    anyhow::ensure!(
+        lines.next().is_some_and(|line| {
+            let mut fields = line.split_whitespace();
+            fields
+                .next()
+                .is_some_and(|v| v.eq_ignore_ascii_case("HTTP/1.1"))
+                && fields.next() == Some("200")
+        }),
+        "Not an SSDP success response"
+    );
+    let location = lines
+        .find_map(|line| {
+            line.split_once(':').and_then(|(key, value)| {
+                key.eq_ignore_ascii_case("location").then_some(value.trim())
+            })
+        })
+        .context("SSDP response has no location")?;
+    descriptor_location(location, from.ip())?;
+    address(&SocketAddr::new(from.ip(), 11000).to_string())
+}
+
+fn descriptor_location(location: &str, player: IpAddr) -> Result<reqwest::Url> {
+    let url = reqwest::Url::parse(location)?;
+    anyhow::ensure!(
+        url.scheme() == "http"
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "Unsupported UPnP location"
+    );
+    let target: IpAddr = url
+        .host_str()
+        .context("UPnP location has no host")?
+        .parse()?;
+    anyhow::ensure!(
+        target == player,
+        "UPnP descriptor host differs from the selected player"
+    );
+    address(&SocketAddr::new(target, url.port().unwrap_or(80)).to_string())?;
+    Ok(url)
 }
 
 #[cfg(test)]
@@ -185,6 +348,53 @@ mod tests {
     fn invalid_identity_fails() {
         assert!(parse_device(address("127.0.0.1").unwrap(), "<error/>", None).is_err());
     }
+    #[test]
+    fn ssdp_m10_uses_bluos_port_not_descriptor_port() {
+        let packet = b"HTTP/1.1 200 OK\r\nlOcAtIoN: http://192.168.1.20:8080/Device.xml\r\nST: upnp:rootdevice\r\n\r\n";
+        assert_eq!(
+            upnp_candidate(packet, "192.168.1.20:1900".parse().unwrap()).unwrap(),
+            "192.168.1.20:11000".parse().unwrap()
+        );
+    }
+    #[test]
+    fn ssdp_rejects_invalid_and_cross_host_locations() {
+        let from = "192.168.1.20:1900".parse().unwrap();
+        for location in [
+            "http://192.168.1.21:8080/Device.xml",
+            "http://8.8.8.8/Device.xml",
+            "https://192.168.1.20/Device.xml",
+            "http://name.local/Device.xml",
+            "http://user@192.168.1.20/Device.xml",
+            "http://192.168.1.20/Device.xml?q=x",
+        ] {
+            let packet = format!("HTTP/1.1 200 OK\r\nLOCATION: {location}\r\n\r\n");
+            assert!(
+                upnp_candidate(packet.as_bytes(), from).is_err(),
+                "{location}"
+            );
+        }
+        assert!(upnp_candidate(
+            b"HTTP/1.1 500 Error\r\nLOCATION: http://192.168.1.20/Device.xml\r\n",
+            from
+        )
+        .is_err());
+        assert!(upnp_candidate(b"HTTP/1.1 200 OK\r\n\r\n", from).is_err());
+    }
+    #[test]
+    fn ssdp_receiver_ignores_malformed_packets_and_deduplicates() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let target = receiver.local_addr().unwrap();
+        sender.send_to(b"invalid", target).unwrap();
+        let packet = b"HTTP/1.1 200 OK\r\nLOCATION: http://127.0.0.1:8080/Device.xml\r\n\r\n";
+        sender.send_to(packet, target).unwrap();
+        sender.send_to(packet, target).unwrap();
+        assert_eq!(
+            collect_upnp(&[receiver], Duration::from_millis(100)).unwrap(),
+            vec!["127.0.0.1:11000".parse::<SocketAddr>().unwrap()]
+        );
+    }
 }
 
 /// Inspect only the supplied player's UPnP root descriptor. No calibration commands.
@@ -200,8 +410,7 @@ pub fn inspect_dirac(input: &str) -> Result<DiracInterface> {
     drop(route);
     let socket = UdpSocket::bind(SocketAddr::new(local, 0))?;
     socket.set_read_timeout(Some(Duration::from_millis(500)))?;
-    let request=b"M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 4\r\nST: upnp:rootdevice\r\n\r\n";
-    socket.send_to(request, SocketAddr::new(player.ip(), 1900))?;
+    socket.send_to(ROOT_SEARCH, SocketAddr::new(player.ip(), 1900))?;
     let until = Instant::now() + Duration::from_secs(6);
     let mut buffer = [0; 8192];
     while Instant::now() < until {
@@ -232,23 +441,8 @@ pub fn inspect_dirac(input: &str) -> Result<DiracInterface> {
         }) else {
             continue;
         };
-        let url = reqwest::Url::parse(location)?;
-        anyhow::ensure!(
-            url.scheme() == "http"
-                && url.username().is_empty()
-                && url.password().is_none()
-                && url.query().is_none(),
-            "Unsupported UPnP location"
-        );
-        let target: IpAddr = url
-            .host_str()
-            .context("UPnP location has no host")?
-            .parse()?;
-        anyhow::ensure!(
-            target == player.ip(),
-            "UPnP descriptor host differs from the selected player"
-        );
-        let addr = SocketAddr::new(target, url.port().unwrap_or(80));
+        let url = descriptor_location(location, player.ip())?;
+        let addr = SocketAddr::new(player.ip(), url.port().unwrap_or(80));
         let xml = get(addr, url.path())?;
         return parse_dirac_descriptor(&xml);
     }

@@ -442,6 +442,30 @@ fn finish(samples: Vec<f32>, sample_rate: u32) -> Result<Recording> {
     })
 }
 
+#[cfg(test)]
+mod pair_validation_tests {
+    use super::*;
+    #[test]
+    fn stereo_routing_rejects_the_same_output_before_opening_audio() {
+        let error = validate_stereo_output("must not open", [0, 0], 48000).unwrap_err();
+        assert!(error.to_string().contains("different output channels"));
+    }
+    #[test]
+    fn cancelled_local_capture_never_opens_audio() {
+        let error = measure_cancellable(
+            "must not open",
+            0,
+            "must not open",
+            0,
+            &[0.01],
+            48000,
+            &AtomicBool::new(true),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cancelled before playback"));
+    }
+}
+
 pub fn capture(input_name: &str, channel: usize, seconds: f64) -> Result<Recording> {
     if !seconds.is_finite() || seconds <= 0.0 || seconds > MAX_SECONDS {
         bail!("Recording duration must be greater than 0 and at most {MAX_SECONDS} seconds");
@@ -636,6 +660,48 @@ pub fn measure(
     sweep: &[f32],
     sample_rate: u32,
 ) -> Result<Recording> {
+    measure_cancellable(
+        input_name,
+        input_channel,
+        output_name,
+        output_channel,
+        sweep,
+        sample_rate,
+        &AtomicBool::new(false),
+    )
+}
+
+/// Check both output channels before any speaker starts playing.
+pub fn validate_stereo_output(
+    output_name: &str,
+    channels: [usize; 2],
+    sample_rate: u32,
+) -> Result<()> {
+    anyhow::ensure!(
+        channels[0] != channels[1],
+        "Left and right speakers must use different output channels"
+    );
+    for channel in channels {
+        select_config(output_name, false, channel, Some(sample_rate))?;
+    }
+    Ok(())
+}
+
+/// Cancellation drops the audio streams, preventing the next speaker's sweep.
+#[allow(clippy::too_many_arguments)]
+pub fn measure_cancellable(
+    input_name: &str,
+    input_channel: usize,
+    output_name: &str,
+    output_channel: usize,
+    sweep: &[f32],
+    sample_rate: u32,
+    cancel: &AtomicBool,
+) -> Result<Recording> {
+    anyhow::ensure!(
+        !cancel.load(Ordering::Relaxed),
+        "Measurement cancelled before playback"
+    );
     if sample_rate == 0 || sample_rate > MAX_RATE {
         bail!("Invalid measurement sample rate");
     }
@@ -680,6 +746,10 @@ pub fn measure(
     input_stream
         .play()
         .context("Starting microphone; check macOS microphone permission")?;
+    anyhow::ensure!(
+        !cancel.load(Ordering::Relaxed),
+        "Measurement cancelled before playback"
+    );
     output_stream
         .play()
         .context("Starting selected audio output")?;
@@ -688,6 +758,7 @@ pub fn measure(
     let mut last_count = 0usize;
     let mut last_input_at = Instant::now();
     loop {
+        anyhow::ensure!(!cancel.load(Ordering::Relaxed), "Measurement cancelled");
         check_failure(&error)?;
         let count = samples
             .lock()

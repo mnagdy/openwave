@@ -1,5 +1,6 @@
 use crate::{
     dsp::{self, Point},
+    listening::{CurvePreset, ListeningArea, Placement},
     project_import,
 };
 use anyhow::Result;
@@ -15,6 +16,9 @@ pub struct Measurement {
     pub included: bool,
     #[serde(default)]
     pub calibration_applied: bool,
+    /// Explicit placement only; imported position indexes do not imply geometry.
+    #[serde(default)]
+    pub placement: Option<Placement>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Session {
@@ -27,6 +31,8 @@ pub struct Session {
     pub max_boost_db: f64,
     pub measurements: Vec<Measurement>,
     pub calibration: Vec<Point>,
+    #[serde(default)]
+    pub listening_area: ListeningArea,
 }
 impl Default for Session {
     fn default() -> Self {
@@ -34,30 +40,19 @@ impl Default for Session {
             version: 1,
             name: "My listening room".into(),
             sample_rate: 48000,
-            target: vec![
-                Point { hz: 20., db: 3. },
-                Point { hz: 80., db: 3. },
-                Point { hz: 200., db: 0. },
-                Point { hz: 1000., db: 0. },
-                Point {
-                    hz: 10000.,
-                    db: -2.,
-                },
-                Point {
-                    hz: 20000.,
-                    db: -4.,
-                },
-            ],
+            target: CurvePreset::Balanced.points(),
             low_hz: 30.,
             high_hz: 500.,
             max_boost_db: 0.,
             measurements: vec![],
             calibration: vec![],
+            listening_area: ListeningArea::default(),
         }
     }
 }
 impl Session {
     pub fn validate(&self) -> Result<()> {
+        self.listening_area.validate()?;
         anyhow::ensure!(self.version == 1, "Unsupported OpenRoom session version");
         anyhow::ensure!(
             (8000..=192000).contains(&self.sample_rate),
@@ -125,6 +120,7 @@ impl Session {
                 source: "Imported Dirac measured-response graph".into(),
                 included: true,
                 calibration_applied: true,
+                placement: None,
             })
             .collect();
         s.validate()?;
@@ -220,6 +216,7 @@ impl Session {
                     source: "Synthetic demonstration".into(),
                     included: true,
                     calibration_applied: true,
+                    placement: None,
                 });
             }
         }
@@ -242,6 +239,38 @@ fn at(p: &[Point], hz: f64) -> f64 {
 mod tests {
     use super::*;
     #[test]
+    fn legacy_sessions_load_without_guessing_measurement_locations() {
+        let mut old = serde_json::to_value(Session::demo()).unwrap();
+        old.as_object_mut().unwrap().remove("listening_area");
+        for m in old["measurements"].as_array_mut().unwrap() {
+            m.as_object_mut().unwrap().remove("placement");
+        }
+        let loaded: Session = serde_json::from_value(old).unwrap();
+        loaded.validate().unwrap();
+        assert!(loaded.measurements.iter().all(|m| m.placement.is_none()));
+        assert_eq!(loaded.listening_area.width_cm, 180.);
+    }
+    #[test]
+    fn placement_and_dimensions_survive_save_without_changing_the_average() {
+        let mut s = Session::demo();
+        let before = s.average(0).unwrap();
+        s.measurements[0].placement = Some(Placement::BackRightLow);
+        s.listening_area.width_cm = 240.;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        s.save(file.path()).unwrap();
+        let loaded = Session::load(file.path()).unwrap();
+        assert_eq!(
+            loaded.measurements[0].placement,
+            Some(Placement::BackRightLow)
+        );
+        assert_eq!(loaded.listening_area.width_cm, 240.);
+        let after = loaded.average(0).unwrap();
+        assert!(before
+            .iter()
+            .zip(after)
+            .all(|(a, b)| (a.db - b.db).abs() < 1e-8));
+    }
+    #[test]
     fn removes_input_gain_before_power_average() {
         let mut s = Session::default();
         for db in [-20., 10.] {
@@ -252,6 +281,7 @@ mod tests {
                 source: "test".into(),
                 included: true,
                 calibration_applied: false,
+                placement: None,
             });
         }
         let p = s.average(0).unwrap();
@@ -279,6 +309,7 @@ mod tests {
                 source: "test".into(),
                 included: true,
                 calibration_applied: false,
+                placement: None,
             });
         }
         let p = s.average(0).unwrap();
@@ -305,6 +336,7 @@ mod tests {
             source: "Raw microphone response".into(),
             included: true,
             calibration_applied: false,
+            placement: None,
         });
         s.measurements.push(Measurement {
             channel: 0,
@@ -313,6 +345,7 @@ mod tests {
             source: "Existing processed graph".into(),
             included: true,
             calibration_applied: true,
+            placement: None,
         });
         let p = s.average(0).unwrap();
         assert!(p.iter().all(|p| p.db.abs() < 1e-8));

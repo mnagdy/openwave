@@ -11,7 +11,7 @@ Open-source room measurement and frequency-response correction, built in Rust fo
 
 > **Early prototype:** curve editing, project import, local filter design, microphone capture, and read-only NAD M10 connectivity have validation evidence. Speaker playback and direct filter transfer have **not** been validated on physical hardware. See [current status](#current-status).
 
-OpenWave is the project name. The current source package, executable, app bundle, and session extension still use the original names: `open-room`, `OpenRoom.app`, and `.openroom.json`.
+OpenWave is the project name. The macOS app is now `OpenWave.app`. The source package and executable remain `open-room`, and saved sessions use `.openroom.json` for compatibility.
 
 ## What you can do
 
@@ -56,15 +56,15 @@ Build the macOS app bundle with:
 
 ```sh
 sh scripts/build-macos.sh
-open dist/OpenRoom.app
+open dist/OpenWave.app
 ```
 
 The script creates an app with a local ad-hoc signature. It is not a Developer ID signed or notarized release.
 
 ## Start with existing measurements
 
-1. In **Connect**, choose **Import a saved Dirac Live project** and select a `.liveproject` file.
-2. In **Shape curve**, select a speaker and review the included listening positions.
+1. In **Set up**, choose **Import a saved Dirac Live project** and select a `.liveproject` file.
+2. In **Shape sound**, select a speaker and review the included listening positions.
 3. Adjust target points, lower and upper correction limits, and maximum boost.
 4. Save your session, then choose an export:
    - **Export target curve** for use in licensed Dirac Live. Dirac calculates and transfers its own filters.
@@ -74,15 +74,29 @@ Targets are currently shared across speakers; each speaker's filter uses its own
 
 Import reads named response graphs, rather than proprietary filter coefficients or unidentified target state. Unsupported metadata is reported. The importer has been checked against five supplied projects; compatibility with every Dirac Live version is not established.
 
+## A guided desktop interface
+
+The desktop uses a single macOS-inspired design system: the installed San Francisco system font when available, a sidebar workflow, rounded cards, blue primary actions, and system-following light and dark appearances. Choose **Appearance** to override the theme, or **Guide & glossary** for plain-language help.
+
+In **Measure**, the sofa guide shows a top view and side view of 13 positions: your main seat at ear level, then front/back and left/centre/right positions at high and low elevations. Switch between high and low planes, select a numbered point, and use the displayed microphone offsets. Listening width, depth and height offsets are adjustable and saved in the session. The diagrams are schematic; adapt locations to avoid furniture, walls and obstructions.
+
+New local, network and WAV-analyzed captures keep their explicitly selected guide position. Each live measurement captures left, then right; after both responses are saved, the guide selects the next position missing a response from either speaker. **Review speaker** changes the displayed response map without changing the microphone position or output routing; individual WAV imports are assigned to that reviewed speaker. Included points are green; excluded takes have an amber review indicator. Older sessions and imported Dirac measurements keep their original indexes and start with **Assign a position…**: choose known locations from the saved-takes list instead of inferring geometry from the numbers. Repeated takes stay saved; exclude unwanted takes from averaging.
+
+In **Shape sound**, choose **Balanced**, **Warm & gentle**, **More bass**, **Less bass**, or **Flat reference**. Selecting a card previews an amber target without changing the session. Choose **Use** to apply it, or cancel the preview. **Undo last preset** restores the prior target. Applying a preset keeps your correction limits and maximum boost and invalidates calculated filters. These are original OpenWave starting points, not Dirac's auto target or guaranteed acoustic results.
+
+Start with **Bass only** (30–500 Hz) to keep mids and treble unchanged; choose **Full range** to apply the preset's treble slope too. Preset bass levels are relative target values, not extra amplifier volume or promises of achieved boost. The maximum-boost limit still applies. Fine adjustment and target import remain available under **Fine-tune target points & import a curve**.
+
+See [interface design and validation](docs/interface.md) for reference sources and checks.
+
 ## Take new measurements
 
 Select an audio input and its physical microphone channel. Use a measurement microphone and its matching manufacturer calibration file when available. A built-in microphone can capture audio, but it is not automatically calibrated for room measurement.
 
-For the local playback route, connect a selected Mac audio output to the amplifier's analogue or optical input, using an interface or DAC if needed. A BluOS network connection by itself does not make the M10 a Mac audio output. Choose the matching amplifier source, disable existing correction and tone controls, and verify the selected output channel feeds the intended speaker.
+For the local playback route, connect a selected stereo Mac audio output to the amplifier's analogue or optical input, using an interface or DAC if needed. A BluOS network connection by itself does not make the M10 a Mac audio output. Choose the matching amplifier source, disable existing correction and tone controls, and match the left and right output channels to the speakers (defaults: 1 and 2).
 
-Start with low amplifier volume. **Play sweep and capture position** emits a −30 dBFS sweep with a 0.5-second lead-in and a 2-second tail. Digital signal level does not establish acoustic SPL. Repeat around the listening seat and review each position before averaging.
+Start with low amplifier volume. **Measure point · both speakers** automatically captures the left speaker, then the right, at the same microphone position. Each emits a −30 dBFS sweep with a 0.5-second lead-in and a 2-second tail. Keep the microphone still until both responses are saved, then move to the next point. Digital signal level does not establish acoustic SPL. **Review speaker** changes the results shown, not the speakers captured or output routing. A stopped or failed pair preserves completed responses and stays at the current position.
 
-The experimental **Network measurement** route uses the M10's advertised finite sweep and a Mac microphone. Capture starts before playback; the controller attempts to restore and read back the prior stimulus gain and operation mode. These lifecycle paths have simulated-endpoint tests, but physical playback, stopping, and restoration remain unverified. New network captures start excluded from averaging until reviewed.
+The experimental **Network measurement** route also captures left, then right, using the M10's advertised finite sweep and a Mac microphone. Separate left/right recordings are saved in the chosen folder. Capture starts before each playback; the controller attempts to restore and read back the prior stimulus gain and operation mode before the next speaker starts. These lifecycle paths have simulated-endpoint tests, but physical playback, stopping, and restoration remain unverified. New network captures start excluded from averaging until reviewed.
 
 Independent playback and microphone clocks can drift. Absolute SPL calibration, clock-drift correction, phase alignment, and uncertainty estimates are not implemented. See [audio measurement](docs/audio.md).
 
@@ -99,7 +113,7 @@ Independent playback and microphone clocks can drift. Absolute SPL calibration, 
 | Native bass-filter design and package preview | Original dual-rate model, offline validation, and desktop preview; firmware behavior remains unverified. |
 | Direct native filter transfer | Experimental executor and simulated lifecycle tests; no transfer has been attempted on the physical M10. |
 
-The [13 October 2026 validation record](docs/validation.md) reports 80 passing library tests, a later rerun of six affected stimulus tests, clean all-target Clippy, and a successful release build. These results establish software checks and the listed observations; they do not establish an end-to-end acoustic correction result.
+The [validation record](docs/validation.md) includes the 14 October updates: 95 passing library tests and 9 GUI tests, clean all-target Clippy, and a successful locked release build and app signature verification. One unrelated loopback SSDP test was excluded under restricted socket permissions. These results establish software checks and the listed observations; they do not establish an end-to-end acoustic correction result.
 
 ### Experimental native transfer
 

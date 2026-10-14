@@ -385,6 +385,10 @@ pub fn play_log_sweep(
     speaker: u32,
     cancel: Arc<AtomicBool>,
 ) -> Result<MeasurementPlan> {
+    ensure!(
+        !cancel.load(Ordering::Relaxed),
+        "Measurement cancelled before amplifier access"
+    );
     let device = nad_v2::inspect(address, port)?;
     let p = plan(&device, speaker)?;
     let ip = crate::device::address(address)?.ip();
@@ -413,6 +417,14 @@ pub fn play_log_sweep(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancelled_public_playback_never_accesses_amplifier() {
+        let error =
+            play_log_sweep("must not access", 0, 0, Arc::new(AtomicBool::new(true))).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cancelled before amplifier access"));
+    }
     fn original_mode() -> NativeOperationMode {
         NativeOperationMode {
             gain_enabled: true,

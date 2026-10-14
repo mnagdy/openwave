@@ -1,3 +1,8 @@
+#[path = "gui_design.rs"]
+mod design;
+#[cfg(test)]
+#[path = "gui_tests.rs"]
+mod tests;
 use anyhow::{Context, Result};
 use eframe::egui::{self, Color32, RichText};
 use egui_plot::{Line, Plot, PlotPoints, Points};
@@ -5,6 +10,8 @@ use open_room::{
     audio,
     device::{self, Device},
     dsp::{self, Point},
+    listening::{CurvePreset, Placement},
+    measurement::{self, PairCapture},
     nad_stimulus, nad_transfer, nad_upload, nad_v2, resample,
     session::{Measurement, Session},
 };
@@ -21,19 +28,15 @@ use std::{
 pub fn run(address: Option<String>, demo: bool) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1180., 790.])
-            .with_min_inner_size([900., 650.]),
+            .with_inner_size([1280., 860.])
+            .with_min_inner_size([980., 720.]),
         ..Default::default()
     };
     eframe::run_native(
-        "OpenRoom",
+        "OpenWave",
         options,
         Box::new(move |cc| {
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
-            let mut style = (*cc.egui_ctx.style()).clone();
-            style.spacing.item_spacing = egui::vec2(10., 9.);
-            style.visuals.selection.bg_fill = Color32::from_rgb(38, 106, 102);
-            cc.egui_ctx.set_style(style);
+            design::configure(&cc.egui_ctx);
             Ok(Box::new(App::new(address, demo)))
         }),
     )
@@ -41,7 +44,7 @@ pub fn run(address: Option<String>, demo: bool) -> Result<()> {
 }
 
 enum Done {
-    Devices(Vec<Device>),
+    Devices(Vec<Device>, Vec<String>),
     Native(nad_v2::NativeDevice, String, u16),
     Audio(
         Vec<audio::AudioInput>,
@@ -51,6 +54,8 @@ enum Done {
     ),
     Session(Session),
     Measurement(Measurement),
+    Measurements(PairCapture),
+    Progress(String),
     Filter(Vec<f32>),
     Message(String),
     Package(nad_transfer::TransferPackage),
@@ -71,12 +76,13 @@ struct App {
     input: String,
     output: String,
     input_channel: usize,
-    output_channel: usize,
+    output_channels: [usize; 2],
     channel: usize,
     seconds: f64,
     status: String,
     error: Option<String>,
     job: Option<Receiver<std::result::Result<Done, String>>>,
+    measuring_pair: bool,
     filter: Vec<f32>,
     filter_channel: usize,
     plot_edit: bool,
@@ -84,10 +90,26 @@ struct App {
     network_ack: bool,
     cancel: Arc<AtomicBool>,
     averages: BTreeMap<usize, Vec<Point>>,
+    placement: Placement,
+    high_plane: bool,
+    preset_preview: Option<CurvePreset>,
+    previous_target: Option<Vec<Point>>,
+    show_help: bool,
 }
 impl App {
     fn new(address: Option<String>, demo: bool) -> Self {
-        let mut a = Self {
+        let mut a = Self::offline(address.clone(), demo);
+        if let Some(ip) = address {
+            a.start("Reading player identity…", move || {
+                Ok(Done::Devices(vec![device::probe(&ip)?], vec![]))
+            })
+        } else {
+            a.refresh_audio()
+        };
+        a
+    }
+    fn offline(address: Option<String>, demo: bool) -> Self {
+        Self {
             session: if demo {
                 Session::demo()
             } else {
@@ -106,12 +128,13 @@ impl App {
             input: String::new(),
             output: String::new(),
             input_channel: 0,
-            output_channel: 0,
+            output_channels: [0, 1],
             channel: 0,
             seconds: 8.,
             status: "Ready. Choose your player and microphone.".into(),
             error: None,
             job: None,
+            measuring_pair: false,
             filter: vec![],
             filter_channel: 0,
             plot_edit: false,
@@ -119,19 +142,22 @@ impl App {
             network_ack: false,
             cancel: Arc::new(AtomicBool::new(false)),
             averages: BTreeMap::new(),
-        };
-        if let Some(ip) = address {
-            a.start("Reading player identity…", move || {
-                Ok(Done::Devices(vec![device::probe(&ip)?]))
-            })
-        } else {
-            a.refresh_audio()
-        };
-        a
+            placement: Placement::Main,
+            high_plane: true,
+            preset_preview: None,
+            previous_target: None,
+            show_help: false,
+        }
     }
     fn start<F>(&mut self, label: &str, f: F)
     where
         F: FnOnce() -> Result<Done> + Send + 'static,
+    {
+        self.start_with_progress(label, move |_| f());
+    }
+    fn start_with_progress<F>(&mut self, label: &str, f: F)
+    where
+        F: FnOnce(mpsc::Sender<std::result::Result<Done, String>>) -> Result<Done> + Send + 'static,
     {
         if self.job.is_some() {
             return;
@@ -142,7 +168,7 @@ impl App {
         let (tx, rx) = mpsc::channel();
         self.job = Some(rx);
         std::thread::spawn(move || {
-            let result = f().map_err(|e| format!("{e:#}"));
+            let result = f(tx.clone()).map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
         });
     }
@@ -169,22 +195,34 @@ impl App {
             None => None,
         };
         if let Some(r) = res {
+            if let Ok(Done::Progress(status)) = &r {
+                if !self.cancel.load(Ordering::Relaxed) {
+                    self.status = status.clone();
+                }
+                return;
+            }
             self.job = None;
+            self.measuring_pair = false;
             match r {
+                Ok(Done::Progress(_)) => unreachable!(),
+                Ok(Done::Measurements(pair)) => self.accept_pair(pair),
                 Err(e) => {
                     self.status = "Operation could not complete.".into();
                     self.error = Some(e)
                 }
-                Ok(Done::Devices(ds)) => {
+                Ok(Done::Devices(ds, warnings)) => {
                     self.native = None;
                     self.native_endpoint = None;
                     self.native_package = None;
                     self.transfer_ack = false;
                     self.status = if ds.is_empty() {
-                        "No players found. Enter the M10 IP address.".into()
+                        "No players found. Check the same network and OpenWave’s Local Network access in System Settings, or enter the player IP and Connect.".into()
                     } else {
                         format!("Connected to {} player(s).", ds.len())
                     };
+                    if ds.is_empty() && !warnings.is_empty() {
+                        self.error = Some(warnings.join("\n"));
+                    }
                     if self.address.is_empty() {
                         if let Some(d) = ds.first() {
                             self.address = d.address.clone();
@@ -222,6 +260,9 @@ impl App {
                 Ok(Done::Session(s)) => {
                     self.session = s;
                     self.channel = 0;
+                    self.placement = Placement::Main;
+                    self.preset_preview = None;
+                    self.previous_target = None;
                     self.invalidate();
                     self.tab = 2;
                     self.status = format!(
@@ -231,12 +272,18 @@ impl App {
                 }
                 Ok(Done::Measurement(m)) => {
                     let needs_review = !m.included;
+                    let placement = m.placement;
                     self.session.measurements.push(m);
+                    if placement.is_some_and(|p| {
+                        measurement::position_complete(&self.session.measurements, p)
+                    }) {
+                        self.select_next_placement();
+                    }
                     self.invalidate();
                     self.status = if needs_review {
                         "Recording saved. Review the new position before including it in curve averaging.".into()
                     } else {
-                        "Measurement captured. Move the microphone for the next position.".into()
+                        "Response saved for the selected speaker.".into()
                     }
                 }
                 Ok(Done::Filter(f)) => {
@@ -258,6 +305,35 @@ impl App {
                     self.transfer_ack = false;
                 }
             }
+        }
+    }
+    fn accept_pair(&mut self, pair: PairCapture) {
+        let placement = pair.measurements.first().and_then(|m| m.placement);
+        let count = pair.measurements.len();
+        let needs_review = pair.measurements.iter().any(|m| !m.included);
+        self.session.measurements.extend(pair.measurements);
+        self.invalidate();
+        if let Some(failure) = pair.failure {
+            self.status = format!(
+                "Position incomplete · {count} of 2 responses saved. Keep the microphone here."
+            );
+            self.error = Some(failure);
+        } else if count == 2 {
+            if placement == Some(self.placement) {
+                self.select_next_placement();
+            }
+            let all_complete = Placement::ALL
+                .iter()
+                .all(|p| measurement::position_complete(&self.session.measurements, *p));
+            self.status = if all_complete && needs_review {
+                "All 13 positions recorded for both speakers. Review the responses before including them in averaging.".into()
+            } else if all_complete {
+                "All 13 positions measured for both speakers. Continue to Shape sound.".into()
+            } else if needs_review {
+                "Both speakers recorded. Review the responses before including them in averaging; then move to the next position.".into()
+            } else {
+                "Both speakers measured. Move the microphone to the next position.".into()
+            };
         }
     }
     fn invalidate(&mut self) {
@@ -299,30 +375,52 @@ impl App {
         }
     }
     fn draw_devices(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Connect your listening room");
-        ui.label("Read player status over your local network, then choose any microphone attached to this Mac.");
+        design::intro(
+            ui,
+            "01 / SET UP",
+            "A better sound starts here",
+            "Bring in your measurements or connect your system to begin a guided session.",
+        );
+        design::card(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                RichText::new("Already measured with Dirac Live?")
+                    .size(18.)
+                    .strong(),
+            );
+            ui.label("Use your saved project to start shaping the sound straight away.");
+            if design::primary(ui, "Import measurements…", true).clicked() {
+                self.import_project();
+            }
+            ui.small("Reads saved response graphs. Your original project stays intact.");
+        });
+        ui.add_space(16.);
+        design::card(ui).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(RichText::new("1. Find your amplifier").size(18.).strong());
+        ui.label("Keep your Mac and BluOS player on the same network. Find players searches for compatible systems.");
         ui.add_space(14.);
         ui.horizontal(|ui| {
             ui.label("Player address");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.address)
-                    .hint_text("192.168.1.20 or IP:port")
-                    .desired_width(280.),
-            );
+            ui.scope(|ui| {
+                ui.visuals_mut().extreme_bg_color = ui.visuals().faint_bg_color;
+                ui.add(egui::TextEdit::singleline(&mut self.address).hint_text("192.168.1.20 or IP:port").desired_width(250.));
+            });
             if ui.button("Connect").clicked() {
                 let ip = self.address.clone();
                 self.start("Reading player identity…", move || {
-                    Ok(Done::Devices(vec![device::probe(&ip)?]))
+                    Ok(Done::Devices(vec![device::probe(&ip)?], vec![]))
                 })
             }
             if ui.button("Find players").clicked() {
-                self.start("Discovering BluOS players…", || {
-                    Ok(Done::Devices(device::discover()?))
+                self.start("Searching for players with Bonjour and UPnP…", || {
+                    let report = device::discover_report()?;
+                    Ok(Done::Devices(report.devices, report.warnings))
                 });
             }
         });
         for d in self.devices.clone() {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
+            design::card(ui).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("●").color(Color32::from_rgb(89, 211, 174)));
                     ui.heading(&d.name);
@@ -386,9 +484,12 @@ impl App {
                 }
             }
         }
-        ui.add_space(15.);
+        });
+        ui.add_space(16.);
+        design::card(ui).show(ui, |ui| {
+        ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
-            ui.heading("Microphone and output");
+            ui.label(RichText::new("2. Choose your microphone").size(18.).strong());
             if ui.button("Refresh devices").clicked() {
                 self.refresh_audio();
             }
@@ -402,10 +503,9 @@ impl App {
             &self.outputs,
         );
         ui.horizontal(|ui| {
-            ui.label("Microphone channel (0 based)");
-            ui.add(egui::DragValue::new(&mut self.input_channel).range(0..=63));
-            ui.label("Playback channel");
-            ui.add(egui::DragValue::new(&mut self.output_channel).range(0..=63));
+            physical_channel(ui, "Microphone channel", &mut self.input_channel);
+            physical_channel(ui, "Left output channel", &mut self.output_channels[0]);
+            physical_channel(ui, "Right output channel", &mut self.output_channels[1]);
         });
         if ui
             .add_enabled(
@@ -442,39 +542,21 @@ impl App {
                 Ok(Done::Message(message))
             });
         }
-        ui.label("For local sweeps, route the selected Mac output into the M10’s analogue or optical input. Select that input on the M10. Choose one speaker channel at a time.");
+        ui.label("For local sweeps, route the selected stereo Mac output into the M10’s analogue or optical input. Match the left and right output channels to your speakers. Each measurement plays left, then right.");
         ui.add_space(16.);
         ui.horizontal(|ui|{if ui.button("Load microphone calibration…").clicked(){if let Some(path)=rfd::FileDialog::new().add_filter("Calibration text",&["txt","cal"]).pick_file(){match std::fs::read_to_string(path).map_err(anyhow::Error::from).and_then(|t|dsp::import_calibration(&t)){Ok(c)=>{self.session.calibration=c;self.invalidate();self.status="Microphone calibration loaded for raw captures. Imported Dirac graphs retain their processing.".into();},Err(e)=>self.error=Some(e.to_string())}}}
 if !self.session.calibration.is_empty(){ui.label(format!("{} calibration points",self.session.calibration.len()));if ui.button("Remove").clicked(){self.session.calibration.clear();self.invalidate();}}});
         ui.small("Without a calibration file, results show the microphone’s response as well as the room. Imported Dirac graphs retain their existing processing.");
-        ui.add_space(20.);
-        ui.heading("Continue from your existing work");
-        if ui.button("Import a saved Dirac Live project…").clicked() {
-            self.import_project();
-        }
-        ui.label("Reads saved measured-response graphs. Your original project is kept intact.");
+        });
     }
     fn draw_measure(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Measure one speaker at a time");
-        ui.label("Use several microphone positions around your listening seat. Start with the M10 volume low. Turn off existing room correction and tone controls before measuring.");
+        design::intro(ui, "02 / MEASURE", "Map the sound around your sofa", "Keep the microphone still while each position measures left, then right. Move it only after both responses are saved.");
+        self.draw_position_guide(ui);
+        ui.add_space(16.);
+        ui.heading("Capture this position");
+        ui.label("Start with the amplifier volume low. Turn off existing correction and tone controls before measuring.");
         ui.add_space(12.);
         ui.horizontal(|ui| {
-            ui.label("Save as");
-            let old = self.channel;
-            speaker_selector(
-                ui,
-                &mut self.channel,
-                self.session
-                    .measurements
-                    .iter()
-                    .map(|m| m.channel)
-                    .max()
-                    .unwrap_or(1)
-                    .max(1),
-            );
-            if old != self.channel {
-                self.output_channel = self.channel;
-            }
             ui.label("Sweep duration");
             ui.add(
                 egui::DragValue::new(&mut self.seconds)
@@ -496,10 +578,9 @@ if !self.session.calibration.is_empty(){ui.label(format!("{} calibration points"
                 });
         });
         ui.horizontal(|ui| {
-            ui.label("Physical playback channel (0 based)");
-            ui.add(egui::DragValue::new(&mut self.output_channel).range(0..=63));
-            ui.label("Microphone channel");
-            ui.add(egui::DragValue::new(&mut self.input_channel).range(0..=63));
+            physical_channel(ui, "Left output channel", &mut self.output_channels[0]);
+            physical_channel(ui, "Right output channel", &mut self.output_channels[1]);
+            physical_channel(ui, "Microphone channel", &mut self.input_channel);
         });
         ui.label(format!(
             "Input: {} (channel {})",
@@ -508,18 +589,20 @@ if !self.session.calibration.is_empty(){ui.label(format!("{} calibration points"
             } else {
                 &self.input
             },
-            self.input_channel
+            self.input_channel + 1
         ));
         ui.label(format!(
-            "Output: {} (channel {})",
+            "Output: {} (left channel {}, right channel {})",
             if self.output.is_empty() {
                 "Select an output"
             } else {
                 &self.output
             },
-            self.output_channel
+            self.output_channels[0] + 1,
+            self.output_channels[1] + 1
         ));
-        self.draw_network_measurement(ui);
+        egui::CollapsingHeader::new("Network measurement · experimental")
+            .show(ui, |ui| self.draw_network_measurement(ui));
         ui.add_space(12.);
         ui.heading("Measurement through a connected Mac output");
         ui.checkbox(
@@ -529,52 +612,82 @@ if !self.session.calibration.is_empty(){ui.label(format!("{} calibration points"
         if ui
             .add_enabled(
                 self.play_ack && !self.input.is_empty() && !self.output.is_empty(),
-                egui::Button::new("Play sweep and capture position"),
+                egui::Button::new(
+                    RichText::new(format!(
+                        "Measure point {} · both speakers",
+                        self.placement.number()
+                    ))
+                    .color(Color32::WHITE),
+                )
+                .fill(design::BLUE),
             )
             .clicked()
         {
             let input = self.input.clone();
             let output = self.output.clone();
             let ic = self.input_channel;
-            let oc = self.output_channel;
-            let ch = self.channel;
+            let output_channels = self.output_channels;
             let rate = self.session.sample_rate;
             let seconds = self.seconds;
-            let pos = self
-                .session
-                .measurements
-                .iter()
-                .filter(|m| m.channel == ch)
-                .map(|m| m.position)
-                .max()
-                .map_or(0, |p| p + 1);
-            self.start("Playing a −30 dBFS sweep and recording…", move || {
-                let sweep = dsp::sweep(&dsp::SweepConfig {
-                    sample_rate: rate,
-                    seconds,
-                    start_hz: 20.,
-                    end_hz: 20000_f64.min(rate as f64 * 0.45),
-                    level_db: -30.,
-                })?;
-                let captured = audio::measure(&input, ic, &output, oc, &sweep, rate)?;
-                anyhow::ensure!(
-                    !captured.clipped,
-                    "Microphone clipped; lower the M10 volume or microphone gain"
-                );
-                anyhow::ensure!(
-                    captured.peak_db > -65.,
-                    "Recorded signal was too quiet; check routing and gain"
-                );
-                let points = dsp::analyze(&sweep, &captured.samples, rate)?;
-                Ok(Done::Measurement(Measurement {
-                    channel: ch,
-                    position: pos,
-                    points,
-                    source: "OpenRoom local sweep capture".into(),
-                    included: true,
-                    calibration_applied: false,
-                }))
-            });
+            let placement = self.placement;
+            let pos = measurement::next_take(&self.session.measurements);
+            let cancel = self.cancel.clone();
+            self.measuring_pair = true;
+            self.start_with_progress(
+                "Measuring both speakers at this position…",
+                move |progress| {
+                    audio::validate_stereo_output(&output, output_channels, rate)?;
+                    let sweep = dsp::sweep(&dsp::SweepConfig {
+                        sample_rate: rate,
+                        seconds,
+                        start_hz: 20.,
+                        end_hz: 20000_f64.min(rate as f64 * 0.45),
+                        level_db: -30.,
+                    })?;
+                    let pair = measurement::capture_pair(
+                        placement,
+                        pos,
+                        &cancel,
+                        |ch| {
+                            let captured = audio::measure_cancellable(
+                                &input,
+                                ic,
+                                &output,
+                                output_channels[ch],
+                                &sweep,
+                                rate,
+                                &cancel,
+                            )?;
+                            anyhow::ensure!(
+                                !captured.clipped,
+                                "Microphone clipped; lower the M10 volume or microphone gain"
+                            );
+                            anyhow::ensure!(
+                                captured.peak_db > -65.,
+                                "Recorded signal was too quiet; check routing and gain"
+                            );
+                            let points = dsp::analyze(&sweep, &captured.samples, rate)?;
+                            Ok(Measurement {
+                                channel: ch,
+                                position: pos,
+                                points,
+                                source: "OpenWave local sweep capture".into(),
+                                included: true,
+                                calibration_applied: false,
+                                placement: Some(placement),
+                            })
+                        },
+                        |ch| {
+                            let _ = progress.send(Ok(Done::Progress(format!(
+                                "Measuring {} · {} of 2 · keep the microphone still",
+                                speaker_name(ch),
+                                ch + 1
+                            ))));
+                        },
+                    );
+                    Ok(Done::Measurements(pair))
+                },
+            );
         }
         ui.add_space(12.);
         ui.horizontal(|ui| {
@@ -598,7 +711,7 @@ if !self.session.calibration.is_empty(){ui.label(format!("{} calibration points"
                     });
                 }
             }
-            if ui.button("Analyze reference + recorded WAV…").clicked() {
+            if ui.button("Analyze WAV for reviewed speaker…").clicked() {
                 if let Some(reference) = rfd::FileDialog::new()
                     .set_title("Select original reference sweep WAV")
                     .add_filter("WAV", &["wav"])
@@ -611,12 +724,15 @@ if !self.session.calibration.is_empty(){ui.label(format!("{} calibration points"
                     {
                         let rate = self.session.sample_rate;
                         let ch = self.channel;
+                        let placement = self.placement;
                         let pos = self
                             .session
                             .measurements
                             .iter()
                             .filter(|m| m.channel == ch)
-                            .count();
+                            .map(|m| m.position)
+                            .max()
+                            .map_or(0, |p| p + 1);
                         self.start("Analyzing recorded sweep…", move || {
                             let x = audio::read_wav(&reference)?;
                             let y = audio::read_wav(&recording)?;
@@ -635,6 +751,7 @@ if !self.session.calibration.is_empty(){ui.label(format!("{} calibration points"
                                 source: "Imported WAV reference + recording".into(),
                                 included: true,
                                 calibration_applied: false,
+                                placement: Some(placement),
                             }))
                         });
                     }
@@ -650,7 +767,10 @@ if !self.session.calibration.is_empty(){ui.label(format!("{} calibration points"
             ui.label("For measurement over Wi-Fi or Ethernet, read amplifier capabilities in Connect first.");
             return;
         };
-        let p = match nad_stimulus::plan(native, self.channel as u32) {
+        let p = match nad_stimulus::plan(native, 0).and_then(|p| {
+            nad_stimulus::plan(native, 1)?;
+            Ok(p)
+        }) {
             Ok(p) => p,
             Err(e) => {
                 ui.label(format!("Network measurement unavailable: {e}"));
@@ -665,21 +785,25 @@ if !self.session.calibration.is_empty(){ui.label(format!("{} calibration points"
             .iter()
             .find(|d| d.name == self.input)
             .map(|d| d.sample_rate);
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        design::card(ui).show(ui, |ui| {
             ui.heading("Measurement over your network · experimental");
-            ui.label(format!("The M10 plays a {:.1}-second sweep through speaker {} while this Mac records. No audio cable from the Mac is needed.",p.sequence_seconds,self.channel+1));
+            ui.label(format!("The M10 plays left, then right, {:.1} seconds per speaker, while this Mac records. Keep the microphone still until both responses are saved. No audio cable from the Mac is needed.",p.sequence_seconds));
             ui.label("Playback and amplifier-state restoration still need a live validation test. Keep other calibration apps closed. Raw audio is saved locally so the result can be checked.");
             ui.checkbox(&mut self.network_ack,"My speakers are ready and the M10 volume is set low");
-            if ui.add_enabled(self.network_ack && mic_rate.is_some_and(|r|(8000..=192000).contains(&r)),egui::Button::new("Play network sweep and record this position…")).clicked() {
-                if let Some(path) = rfd::FileDialog::new().set_title("Save the microphone recording").add_filter("WAV",&["wav"]).set_file_name("m10-measurement.wav").save_file() {
-                    let input=self.input.clone();let mic=self.input_channel;let ch=self.channel;
+            if ui.add_enabled(self.network_ack && mic_rate.is_some_and(|r|(8000..=192000).contains(&r)),egui::Button::new("Measure both speakers over the network…")).clicked() {
+                if let Some(folder) = rfd::FileDialog::new().set_title("Choose a folder for both microphone recordings").pick_folder() {
+                    let input=self.input.clone();let mic=self.input_channel;let placement=self.placement;
                     let rate=mic_rate.unwrap();
-                    let pos=self.session.measurements.iter().filter(|m|m.channel==ch).map(|m|m.position).max().map_or(0,|p|p+1);
+                    let pos=measurement::next_take(&self.session.measurements);
+                    let capture_id = uuid::Uuid::new_v4();
                     let cancel=self.cancel.clone();
-                    self.start("Recording the M10 network sweep…",move || {
+                    self.measuring_pair = true;
+                    self.start_with_progress("Measuring both speakers over the network…",move |progress| {
+                        let pair = measurement::capture_pair(placement, pos, &cancel, |ch| {
+                        let path = folder.join(format!("m10-point-{}-{}-{}.wav", placement.number(), capture_id, if ch == 0 { "left" } else { "right" }));
                         let mut played=None;
                         let captured=audio::capture_with_action(&input,mic,rate,2.,|| {
-                            played=Some(nad_stimulus::play_log_sweep(&address,port,ch as u32,cancel)?); Ok(())
+                            played=Some(nad_stimulus::play_log_sweep(&address,port,ch as u32,cancel.clone())?); Ok(())
                         })?;
                         audio::write_wav(&path,&captured.samples,captured.sample_rate)?;
                         anyhow::ensure!(!captured.clipped,"Recording clipped. Lower the M10 volume; the raw recording has been saved.");
@@ -687,35 +811,147 @@ if !self.session.calibration.is_empty(){ui.label(format!("{} calibration points"
                         let reference=nad_stimulus::reference(&played.context("Native playback did not return its waveform profile")?)?;
                         let reference=resample::resample_reference(&reference,48000,rate)?;
                         let points=dsp::analyze(&reference,&captured.samples,rate)?;
-                        Ok(Done::Measurement(Measurement {channel:ch,position:pos,points,source:format!("M10 native sweep estimate; raw audio: {}",path.display()),included:false,calibration_applied:false}))
+                        Ok(Measurement {channel:ch,position:pos,points,source:format!("M10 native sweep estimate; raw audio: {}",path.display()),included:false,calibration_applied:false,placement:Some(placement)})
+                        }, |ch| {
+                            let _ = progress.send(Ok(Done::Progress(format!("Measuring {} over the network · {} of 2 · keep the microphone still", speaker_name(ch), ch + 1))));
+                        });
+                        Ok(Done::Measurements(pair))
                     });
                 }
             }
             ui.small("New network measurements start excluded from curve averaging until you review them.");
         });
     }
+    fn select_next_placement(&mut self) {
+        if let Some(p) = Placement::ALL
+            .into_iter()
+            .find(|p| !measurement::position_complete(&self.session.measurements, *p))
+        {
+            self.placement = p;
+            if p != Placement::Main {
+                self.high_plane = p.axes()[2] > 0.;
+            }
+        }
+    }
+    fn draw_position_guide(&mut self, ui: &mut egui::Ui) {
+        design::card(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let states: Vec<_> = self.session.measurements.iter().filter(|m| m.channel == self.channel).filter_map(|m| m.placement.map(|p| (p, m.included))).collect();
+            let complete = Placement::ALL.iter().filter(|p| measurement::position_complete(&self.session.measurements, **p)).count();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Your listening area").size(18.).strong());
+                ui.label("Review speaker");
+                speaker_selector(ui, &mut self.channel, self.session.measurements.iter().map(|m| m.channel).max().unwrap_or(1).max(1));
+                ui.label(format!("{complete} / 13 positions captured for both speakers"));
+            });
+            ui.small("Live measurements capture both speakers. Review a speaker’s saved responses here; WAV imports are assigned to the reviewed speaker.");
+            ui.horizontal(|ui| {
+                let changed = ui.selectable_value(&mut self.high_plane, true, "High positions").changed()
+                    | ui.selectable_value(&mut self.high_plane, false, "Low positions").changed();
+                if changed && self.placement != Placement::Main {
+                    let [x, y, _] = self.placement.axes();
+                    self.placement = Placement::ALL.into_iter().find(|p| {
+                        let [px, py, z] = p.axes();
+                        px == x && py == y && (z > 0.) == self.high_plane && z != 0.
+                    }).unwrap();
+                }
+                ui.label(RichText::new("Blue: selected  ·  Green: included  ·  Amber: review").small().color(design::secondary(ui)));
+            });
+            ui.columns(2, |cols| {
+                design::sofa_map(&mut cols[0], &mut self.placement, self.high_plane, &states);
+                design::elevation(&mut cols[1], self.placement, self.session.listening_area.height_cm, self.session.listening_area.depth_cm);
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("guide_point").width(295.).selected_text(format!("{} · {}", self.placement.number(), self.placement.label())).show_ui(ui, |ui| {
+                    for p in Placement::ALL {
+                        if ui.selectable_value(&mut self.placement, p, format!("{} · {}", p.number(), p.label())).changed() && p != Placement::Main { self.high_plane = p.axes()[2] > 0.; }
+                    }
+                });
+                if ui.button("Next incomplete position").clicked() { self.select_next_placement(); }
+            });
+            let [x, y, z] = self.session.listening_area.offsets(self.placement);
+            if self.placement == Placement::Main {
+                ui.label("Place the microphone at seated ear level in your main listening position. Measure this point first.");
+            } else {
+                let horizontal = if x == 0. { "centred on your main seat".into() } else { format!("{:.0} cm to your {}", x.abs(), if x < 0. { "left" } else { "right" }) };
+                ui.label(format!("Move {horizontal}, {:.0} cm {}, and {:.0} cm {} seated ear level.", y.abs(), if y < 0. { "toward the speakers" } else { "away from the speakers" }, z.abs(), if z > 0. { "above" } else { "below" }));
+            }
+            if states.iter().any(|(p,_)| *p == self.placement) {
+                ui.label(RichText::new("This point already has a take. Another capture keeps both; exclude an unwanted take below.").small().color(ui.visuals().warn_fg_color));
+            }
+            egui::CollapsingHeader::new("Adjust the guide to your sofa").show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Listening width");
+                    ui.add(egui::DragValue::new(&mut self.session.listening_area.width_cm).range(100. ..=400.).suffix(" cm"));
+                    ui.label("Front / back offset");
+                    ui.add(egui::DragValue::new(&mut self.session.listening_area.depth_cm).range(30. ..=100.).suffix(" cm"));
+                    ui.label("High / low offset");
+                    ui.add(egui::DragValue::new(&mut self.session.listening_area.height_cm).range(15. ..=60.).suffix(" cm"));
+                });
+                ui.small("Width is the spread of the outer microphone points. Offsets are measured from point 1. These dimensions are a placement guide, not a record of the exact microphone coordinates.");
+            });
+        });
+        ui.add_space(10.);
+        design::note(ui, "A few tips before you measure", "Use a stand; keep the microphone clear of cushions, walls and the sofa back. Include space just outside the sofa where practical. Point an omnidirectional microphone upward with its matching 90° calibration file, following the microphone maker’s instructions. Keep the room quiet during each sweep.");
+    }
     fn measurement_list(&mut self, ui: &mut egui::Ui) {
         ui.heading(format!(
             "{} saved responses",
             self.session.measurements.len()
         ));
+        ui.small("Checked takes contribute to the curve. Assign known sofa positions to imported takes; their original point numbers do not identify a location.");
         let mut delete = None;
         let mut changed = false;
         egui::ScrollArea::vertical()
             .max_height(220.)
             .show(ui, |ui| {
                 for (i, m) in self.session.measurements.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        changed |= ui
-                            .checkbox(
-                                &mut m.included,
-                                format!("Speaker {} · position {}", m.channel + 1, m.position + 1),
+                    ui.push_id(i, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            changed |= ui
+                                .checkbox(
+                                    &mut m.included,
+                                    format!(
+                                        "{} · take {}",
+                                        speaker_name(m.channel),
+                                        m.position + 1
+                                    ),
+                                )
+                                .changed();
+                            egui::ComboBox::from_id_salt("placement")
+                                .width(230.)
+                                .selected_text(
+                                    m.placement.map_or("Assign a position…", Placement::label),
+                                )
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut m.placement, None, "Unassigned");
+                                    for p in Placement::ALL {
+                                        ui.selectable_value(
+                                            &mut m.placement,
+                                            Some(p),
+                                            format!("{} · {}", p.number(), p.label()),
+                                        );
+                                    }
+                                });
+                            ui.label(
+                                RichText::new(if m.included {
+                                    "Included"
+                                } else {
+                                    "Excluded / review"
+                                })
+                                .small()
+                                .color(if m.included {
+                                    design::GREEN
+                                } else {
+                                    ui.visuals().warn_fg_color
+                                }),
                             )
-                            .changed();
-                        ui.small(&m.source);
-                        if ui.small_button("Remove").clicked() {
-                            delete = Some(i)
-                        }
+                            .on_hover_text(&m.source);
+                            if ui.small_button("Remove").clicked() {
+                                delete = Some(i)
+                            }
+                        });
                     });
                 }
             });
@@ -728,8 +964,16 @@ if !self.session.calibration.is_empty(){ui.label(format!("{} calibration points"
         }
     }
     fn draw_curve(&mut self, ui: &mut egui::Ui) {
+        design::intro(
+            ui,
+            "03 / SHAPE",
+            "Find the sound you like",
+            "Choose a starting point, preview the target, then make it your own.",
+        );
+        self.draw_presets(ui);
+        ui.add_space(16.);
         ui.horizontal(|ui| {
-            ui.heading("Shape your target curve");
+            ui.heading("Your measured sound & target");
             speaker_selector(
                 ui,
                 &mut self.channel,
@@ -741,7 +985,7 @@ if !self.session.calibration.is_empty(){ui.label(format!("{} calibration points"
                     .unwrap_or(1),
             );
         });
-        ui.label("Measured responses are normalized around 500–2000 Hz and averaged by power. This target is shared across speakers; measured corrections remain per speaker.");
+        ui.small("Grey: measured sound. Blue: target. Vertical lines: correction limits.");
         let average = if let Some(p) = self.averages.get(&self.channel) {
             Ok(p.clone())
         } else {
@@ -752,14 +996,26 @@ if !self.session.calibration.is_empty(){ui.label(format!("{} calibration points"
             r
         };
         if let Err(e) = &average {
-            ui.label(RichText::new(e.to_string()).color(Color32::LIGHT_YELLOW));
+            design::note(
+                ui,
+                "Add measurements to see your room response",
+                &e.to_string(),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Import a Dirac Live project…").clicked() {
+                    self.import_project();
+                }
+                if ui.button("Go to measurement guide").clicked() {
+                    self.tab = 1;
+                }
+            });
         }
         let target =
             PlotPoints::from_iter(self.session.target.iter().map(|p| [p.hz.log10(), p.db]));
-        ui.checkbox(&mut self.plot_edit, "Click the graph to add a target point");
+
         let mut pointer = None;
         let response = Plot::new("response")
-            .height(310.)
+            .height((ui.ctx().screen_rect().height() - 570.).clamp(200., 310.))
             .allow_drag(!self.plot_edit)
             .include_x(20f64.log10())
             .include_x(20000f64.log10())
@@ -784,21 +1040,31 @@ if !self.session.calibration.is_empty(){ui.label(format!("{} calibration points"
                             measured.iter().map(|x| [x.hz.log10(), x.db]),
                         ))
                         .name("Measured average")
-                        .color(Color32::from_rgb(126, 146, 190)),
+                        .color(Color32::from_rgb(140, 150, 170)),
                     );
                 }
                 p.line(
                     Line::new(target)
                         .name("Target")
-                        .color(Color32::from_rgb(103, 223, 185))
+                        .color(design::BLUE)
                         .width(2.5_f32),
                 );
+                if let Some(preset) = self.preset_preview {
+                    p.line(
+                        Line::new(PlotPoints::from_iter(
+                            preset.points().iter().map(|x| [x.hz.log10(), x.db]),
+                        ))
+                        .name("Preset preview · not applied")
+                        .color(Color32::from_rgb(192, 120, 30))
+                        .width(2_f32),
+                    );
+                }
                 p.points(
                     Points::new(PlotPoints::from_iter(
                         self.session.target.iter().map(|x| [x.hz.log10(), x.db]),
                     ))
                     .radius(4_f32)
-                    .color(Color32::from_rgb(103, 223, 185)),
+                    .color(design::BLUE),
                 );
                 p.vline(egui_plot::VLine::new(self.session.low_hz.log10()).color(Color32::GRAY));
                 p.vline(egui_plot::VLine::new(self.session.high_hz.log10()).color(Color32::GRAY));
@@ -824,13 +1090,17 @@ if !self.session.calibration.is_empty(){ui.label(format!("{} calibration points"
                 }
             }
         }
+        ui.checkbox(
+            &mut self.plot_edit,
+            "Edit target · click the graph to add a point",
+        );
         let mut changed = false;
         ui.horizontal(|ui| {
             ui.label("Correction from");
             changed |= ui
                 .add(
                     egui::DragValue::new(&mut self.session.low_hz)
-                        .range(10. ..=10000.)
+                        .range(10. ..=(self.session.high_hz - 1.))
                         .suffix(" Hz"),
                 )
                 .changed();
@@ -838,7 +1108,10 @@ if !self.session.calibration.is_empty(){ui.label(format!("{} calibration points"
             changed |= ui
                 .add(
                     egui::DragValue::new(&mut self.session.high_hz)
-                        .range(20. ..=20000.)
+                        .range(
+                            (self.session.low_hz + 1.)
+                                ..=20000_f64.min(self.session.sample_rate as f64 * 0.45),
+                        )
                         .suffix(" Hz"),
                 )
                 .changed();
@@ -851,80 +1124,83 @@ if !self.session.calibration.is_empty(){ui.label(format!("{} calibration points"
                 )
                 .changed();
         });
-        ui.horizontal(|ui| {
-            egui::ScrollArea::vertical()
-                .min_scrolled_height(150.)
-                .max_height(150.)
-                .show(ui, |ui| {
-                    let mut del = None;
-                    egui::Grid::new("curve_points")
-                        .striped(true)
-                        .show(ui, |ui| {
-                            ui.label("Frequency");
-                            ui.label("Target level");
-                            ui.label("");
-                            ui.end_row();
-                            for (i, p) in self.session.target.iter_mut().enumerate() {
-                                changed |= ui
-                                    .add(
-                                        egui::DragValue::new(&mut p.hz)
-                                            .range(10. ..=22000.)
-                                            .suffix(" Hz"),
-                                    )
-                                    .changed();
-                                changed |= ui
-                                    .add(
-                                        egui::DragValue::new(&mut p.db)
-                                            .range(-30. ..=12.)
-                                            .suffix(" dB"),
-                                    )
-                                    .changed();
-                                if ui.small_button("×").clicked() {
-                                    del = Some(i);
-                                }
+        ui.small("Only the frequencies between the vertical lines are corrected. A bass target above zero may need boost; the boost limit can prevent reaching it.");
+        egui::CollapsingHeader::new("Fine-tune target points & import a curve").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                egui::ScrollArea::vertical()
+                    .min_scrolled_height(150.)
+                    .max_height(150.)
+                    .show(ui, |ui| {
+                        let mut del = None;
+                        egui::Grid::new("curve_points")
+                            .striped(true)
+                            .show(ui, |ui| {
+                                ui.label("Frequency");
+                                ui.label("Target level");
+                                ui.label("");
                                 ui.end_row();
-                            }
-                        });
-                    if let Some(i) = del {
-                        if self.session.target.len() > 2 {
-                            self.session.target.remove(i);
-                            changed = true;
-                        }
-                    }
-                });
-            ui.vertical(|ui| {
-                if ui.button("Add point").clicked() {
-                    let hz = (1..2200)
-                        .map(|i| i as f64 * 10.)
-                        .find(|h| self.session.target.iter().all(|p| p.hz != *h))
-                        .unwrap_or(1000.);
-                    self.session.target.push(Point { hz, db: 0. });
-                    changed = true;
-                }
-                if ui.button("Import target…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Dirac target", &["txt", "targetcurve"])
-                        .pick_file()
-                    {
-                        match std::fs::read_to_string(path)
-                            .map_err(anyhow::Error::from)
-                            .and_then(|t| dsp::import_target(&t))
-                        {
-                            Ok((p, l, h)) => {
-                                self.session.target = p;
-                                self.session.low_hz = l;
-                                self.session.high_hz = h;
+                                for (i, p) in self.session.target.iter_mut().enumerate() {
+                                    changed |= ui
+                                        .add(
+                                            egui::DragValue::new(&mut p.hz)
+                                                .range(10. ..=22000.)
+                                                .suffix(" Hz"),
+                                        )
+                                        .changed();
+                                    changed |= ui
+                                        .add(
+                                            egui::DragValue::new(&mut p.db)
+                                                .range(-30. ..=12.)
+                                                .suffix(" dB"),
+                                        )
+                                        .changed();
+                                    if ui.small_button("×").clicked() {
+                                        del = Some(i);
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                        if let Some(i) = del {
+                            if self.session.target.len() > 2 {
+                                self.session.target.remove(i);
                                 changed = true;
                             }
-                            Err(e) => self.error = Some(e.to_string()),
+                        }
+                    });
+                ui.vertical(|ui| {
+                    if ui.button("Add point").clicked() {
+                        let hz = (1..2200)
+                            .map(|i| i as f64 * 10.)
+                            .find(|h| self.session.target.iter().all(|p| p.hz != *h))
+                            .unwrap_or(1000.);
+                        self.session.target.push(Point { hz, db: 0. });
+                        changed = true;
+                    }
+                    if ui.button("Import target…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Dirac target", &["txt", "targetcurve"])
+                            .pick_file()
+                        {
+                            match std::fs::read_to_string(path)
+                                .map_err(anyhow::Error::from)
+                                .and_then(|t| dsp::import_target(&t))
+                            {
+                                Ok((p, l, h)) => {
+                                    self.session.target = p;
+                                    self.session.low_hz = l;
+                                    self.session.high_hz = h;
+                                    changed = true;
+                                }
+                                Err(e) => self.error = Some(e.to_string()),
+                            }
                         }
                     }
-                }
-                if ui.button("Flat target").clicked() {
-                    self.session.target =
-                        vec![Point { hz: 20., db: 0. }, Point { hz: 20000., db: 0. }];
-                    changed = true;
-                }
+                    if ui.button("Flat target").clicked() {
+                        self.session.target =
+                            vec![Point { hz: 20., db: 0. }, Point { hz: 20000., db: 0. }];
+                        changed = true;
+                    }
+                });
             });
         });
         if changed {
@@ -932,28 +1208,80 @@ if !self.session.calibration.is_empty(){ui.label(format!("{} calibration points"
             self.invalidate();
         }
     }
+    fn draw_presets(&mut self, ui: &mut egui::Ui) {
+        design::card(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Choose a sound").size(18.).strong());
+                let active = CurvePreset::ALL.into_iter().find(|p| p.matches(&self.session.target));
+                ui.small(format!("Current: {}", active.map_or("Custom curve", CurvePreset::name)));
+            });
+            let width = (ui.available_width() - ui.spacing().item_spacing.x * 4.) / 5.;
+            ui.horizontal(|ui| {
+                for preset in CurvePreset::ALL {
+                    if design::preset_tile(ui, preset, self.preset_preview == Some(preset), width) {
+                        self.preset_preview = Some(preset);
+                    }
+                }
+            });
+            if let Some(preset) = self.preset_preview {
+                ui.label(preset.purpose());
+                ui.horizontal(|ui| {
+                    if design::primary(ui, &format!("Use {}", preset.name()), true).clicked() {
+                        self.previous_target = Some(self.session.target.clone());
+                        self.session.target = preset.points();
+                        self.preset_preview = None;
+                        self.invalidate();
+                        self.status = format!("{} target applied to both speakers. Correction range and boost limits kept.", preset.name());
+                    }
+                    if ui.button("Cancel preview").clicked() { self.preset_preview = None; }
+                });
+            } else {
+                ui.label("Select a card to preview it on the graph. Your current curve changes when you choose Use.");
+            }
+            if self.previous_target.is_some() && ui.small_button("Undo last preset").clicked() {
+                self.session.target = self.previous_target.take().unwrap();
+                self.preset_preview = None;
+                self.invalidate();
+                self.status = "Previous target restored.".into();
+            }
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Correction range").strong());
+                if ui.selectable_label(self.session.high_hz <= 500., "Bass only · up to 500 Hz").clicked() {
+                    self.session.low_hz = 30.; self.session.high_hz = 500.; self.invalidate();
+                }
+                if ui.selectable_label(self.session.high_hz > 500., "Full range").clicked() {
+                    self.session.low_hz = 30.; self.session.high_hz = 20000_f64.min(self.session.sample_rate as f64 * 0.45); self.invalidate();
+                }
+            });
+            ui.small(if self.session.high_hz <= 500. { "Bass only keeps mids and treble unchanged. Choose Full range to apply treble changes too." } else { "Full range includes mids and treble. Use a calibrated microphone. M10 native export supports bass only." });
+            ui.small("About these presets").on_hover_text("These are OpenWave starting points, not Dirac’s auto target or guaranteed outcomes. The target is shared across speakers; each uses its own measured average. Choose by listening after export.");
+        });
+    }
     fn draw_export(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Take your curves to the M10");
-        self.draw_native_package(ui);
+        design::intro(ui, "04 / EXPORT", "Bring your new curve to life", "Save a target for Dirac Live, or export an independent filter for a software convolver.");
         ui.add_space(14.);
         ui.label("You can also export a target curve for installed Dirac Live to calculate and transfer.");
         ui.add_space(14.);
-        egui::Frame::group(ui.style()).show(ui,|ui|{ui.heading("Target curve → Dirac Live → M10");ui.label("1. Export the target curve below.");ui.label("2. Open your saved project in Dirac Live and load this target for each speaker group.");ui.label("3. Calculate, then export to a chosen M10 filter slot.");if ui.button("Export target curve…").clicked(){if let Some(path)=rfd::FileDialog::new().set_file_name("openroom-target.txt").save_file(){match dsp::export_target(&self.session.target,self.session.low_hz,self.session.high_hz).and_then(|t|{std::fs::write(&path,t)?;Ok(())}){Ok(())=>self.status=format!("Saved {}. Load it in Dirac Live to transfer.",path.display()),Err(e)=>self.error=Some(e.to_string())}}}
+        design::card(ui).show(ui,|ui|{ui.set_width(ui.available_width());ui.heading("Target curve → Dirac Live → M10");ui.label("1. Export the target curve below.");ui.label("2. Open your saved project in Dirac Live and load this target for each speaker group.");ui.label("3. Calculate, then export to a chosen M10 filter slot.");if design::primary(ui,"Export target curve…",true).clicked(){if let Some(path)=rfd::FileDialog::new().set_file_name("openroom-target.txt").save_file(){match dsp::export_target(&self.session.target,self.session.low_hz,self.session.high_hz).and_then(|t|{std::fs::write(&path,t)?;Ok(())}){Ok(())=>self.status=format!("Saved {}. Load it in Dirac Live to transfer.",path.display()),Err(e)=>self.error=Some(e.to_string())}}}
 if ui.button("Open installed Dirac Live").clicked(){self.start("Opening Dirac Live…",||{let s=std::process::Command::new("/usr/bin/open").args(["-a","DiracLive"]).status()?;anyhow::ensure!(s.success(),"Could not open Dirac Live");Ok(Done::Message("Dirac Live opened. Load your saved project and exported target.".into()))});}});
         ui.add_space(15.);
-        egui::Frame::group(ui.style()).show(ui,|ui|{ui.heading("Independent FIR for a local convolver");ui.label("OpenRoom’s own magnitude correction uses a linear-phase FIR. This WAV is for a software convolver; M10 filter slots do not accept it through a verified interface.");speaker_selector(ui,&mut self.channel,self.session.measurements.iter().map(|m|m.channel).max().unwrap_or(1));
+        design::card(ui).show(ui,|ui|{ui.set_width(ui.available_width());ui.heading("Independent FIR for a local convolver");ui.label("OpenWave’s own magnitude correction uses a linear-phase FIR. This WAV is for a software convolver; M10 filter slots do not accept it through a verified interface.");speaker_selector(ui,&mut self.channel,self.session.measurements.iter().map(|m|m.channel).max().unwrap_or(1));
    if ui.button("Calculate FIR").clicked(){let s=self.session.clone();let channel=self.channel;self.start("Designing independent correction filter…",move||{s.validate()?;let measured=s.average(channel)?;Ok(Done::Filter(dsp::design_filter(&measured,&s.target,s.sample_rate,4097,s.low_hz,s.high_hz,s.max_boost_db)?))});}
    if !self.filter.is_empty(){ui.label(format!("{} taps @ {} Hz · speaker {} · linear-phase delay {:.1} ms",self.filter.len(),self.session.sample_rate,self.filter_channel+1,(self.filter.len()-1)as f64/2./self.session.sample_rate as f64*1000.));if ui.button("Save FIR WAV…").clicked(){if let Some(path)=rfd::FileDialog::new().set_file_name(format!("speaker-{}-fir.wav",self.filter_channel+1)).save_file(){let f=self.filter.clone();let rate=self.session.sample_rate;self.start("Saving FIR…",move||{audio::write_wav(&path,&f,rate)?;Ok(Done::Message(format!("Saved {}",path.display())))});}}}
   });
         ui.add_space(16.);
         ui.label(
             RichText::new("Direct M10 filter upload remains unverified.")
-                .color(Color32::LIGHT_YELLOW),
+                .color(ui.visuals().warn_fg_color),
         );
         ui.label("The independent transfer is experimental. Successful acknowledgements do not establish the applied frequency response.");
+        egui::CollapsingHeader::new("Experimental direct M10 transfer")
+            .show(ui, |ui| self.draw_native_package(ui));
     }
     fn draw_native_package(&mut self, ui: &mut egui::Ui) {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        design::card(ui).show(ui, |ui| {
             ui.heading("Independent amplifier filter · experimental");
             ui.small("Native correction currently supports 20–500 Hz and up to 6 dB boost. Set those limits in Shape curve before preparing.");
             ui.label("Prepare both speakers’ filters for the M10’s native format. Preparing and saving a preview sends nothing. Sending a filter is a separate experimental action; hardware acceptance and the applied sound still need validation.");
@@ -1006,39 +1334,48 @@ if ui.button("Open installed Dirac Live").clicked(){self.start("Opening Dirac Li
 }
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        self.render(ctx);
+    }
+}
+impl App {
+    fn render(&mut self, ctx: &egui::Context) {
         self.poll();
         if self.job.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
-        egui::TopBottomPanel::top("header").show(ctx, |ui| {
-            ui.add_space(8.);
-            ui.horizontal(|ui| {
-                ui.heading(RichText::new("OpenRoom").color(Color32::from_rgb(103, 223, 185)));
-                ui.label("Room measurement & curve design");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_enabled_ui(self.job.is_none(), |ui| {
-                        if ui.button("Save session").clicked() {
-                            self.save_session();
-                        }
-                        if ui.button("Open session").clicked() {
-                            self.open_session();
-                        }
+        egui::TopBottomPanel::top("header")
+            .frame(
+                egui::Frame::none()
+                    .fill(ctx.style().visuals.window_fill)
+                    .inner_margin(egui::Margin::symmetric(20., 12.)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&self.session.name).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.menu_button("Appearance", |ui| {
+                            for (label, preference) in [
+                                ("Follow macOS", egui::ThemePreference::System),
+                                ("Light", egui::ThemePreference::Light),
+                                ("Dark", egui::ThemePreference::Dark),
+                            ] {
+                                if ui.button(label).clicked() {
+                                    ctx.set_theme(preference);
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                        ui.add_enabled_ui(self.job.is_none(), |ui| {
+                            if ui.button("Save session…").clicked() {
+                                self.save_session();
+                            }
+                            if ui.button("Open…").clicked() {
+                                self.open_session();
+                            }
+                        });
                     });
                 });
             });
-            ui.add_space(7.);
-            ui.horizontal(|ui| {
-                for (i, name) in ["1  Connect", "2  Measure", "3  Shape curve", "4  Export"]
-                    .iter()
-                    .enumerate()
-                {
-                    if ui.selectable_label(self.tab == i, *name).clicked() {
-                        self.tab = i;
-                    }
-                }
-            });
-            ui.add_space(6.);
-        });
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if self.job.is_some() {
@@ -1046,11 +1383,12 @@ impl eframe::App for App {
                 }
                 ui.label(&self.status);
                 if self.job.is_some()
-                    && self.status == "Recording the M10 network sweep…"
+                    && self.measuring_pair
+                    && !self.cancel.load(Ordering::Relaxed)
                     && ui.button("Stop test").clicked()
                 {
                     self.cancel.store(true, Ordering::Relaxed);
-                    self.status = "Stopping the test and restoring amplifier settings…".into();
+                    self.status = "Stopping the measurement; keeping completed responses and restoring any amplifier changes…".into();
                 }
                 if self.job.is_some()
                     && self.status == "Transferring the experimental M10 filter…"
@@ -1069,16 +1407,79 @@ impl eframe::App for App {
                 });
             }
         });
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
+        egui::SidePanel::left("workflow").exact_width(212.).resizable(false).frame(egui::Frame::none().fill(ctx.style().visuals.faint_bg_color).inner_margin(18.)).show(ctx, |ui| {
+            ui.add_space(12.);
+            ui.label(RichText::new("OpenWave").size(26.).strong());
+            ui.label(RichText::new("Shape your sound").small().color(design::secondary(ui)));
+            ui.add_space(28.);
+            ui.label(RichText::new("YOUR SESSION").small().color(design::secondary(ui)));
+            for (i, (name, detail)) in [("Set up", "System & microphone"), ("Measure", "Your sofa, in 3D"), ("Shape sound", "Curves & correction"), ("Export", "Use your new target")].into_iter().enumerate() {
+                let selected = self.tab == i;
+                let fill = if selected { design::BLUE } else { Color32::TRANSPARENT };
+                let color = if selected { Color32::WHITE } else { ui.visuals().text_color() };
+                if ui.add(egui::Button::new(RichText::new(format!("{:02}   {name}", i+1)).color(color).strong()).fill(fill).min_size(egui::vec2(176., 36.))).clicked() { self.tab = i; }
+                ui.label(RichText::new(detail).small().color(design::secondary(ui)));
                 ui.add_space(10.);
-                ui.add_enabled_ui(self.job.is_none(), |ui| match self.tab {
-                    0 => self.draw_devices(ui),
-                    1 => self.draw_measure(ui),
-                    2 => self.draw_curve(ui),
-                    _ => self.draw_export(ui),
-                });
+            }
+            ui.add_space(18.);
+            ui.separator();
+            ui.small(format!("{} saved responses", self.session.measurements.len()));
+            ui.small(format!("{} included", self.session.measurements.iter().filter(|m| m.included).count()));
+            ui.add_space(12.);
+            if ui.button("Guide & glossary").clicked() { self.show_help = true; }
+            ui.hyperlink_to("Dirac placement guide ↗", "https://helpdesk.dirac.com/en/dirac-room-correction/In-what-order-should-I-measure-the-positions-cbe");
+        });
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(ctx.style().visuals.panel_fill)
+                    .inner_margin(24.),
+            )
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt(("page", self.tab))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add_enabled_ui(self.job.is_none(), |ui| match self.tab {
+                            0 => self.draw_devices(ui),
+                            1 => self.draw_measure(ui),
+                            2 => self.draw_curve(ui),
+                            _ => self.draw_export(ui),
+                        });
+                        ui.add_space(24.);
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if self.tab > 0 && ui.button("← Back").clicked() {
+                                self.tab -= 1;
+                            }
+                            if self.tab < 3
+                                && design::primary(
+                                    ui,
+                                    [
+                                        "Continue to measurement",
+                                        "Continue to curves",
+                                        "Continue to export",
+                                    ][self.tab],
+                                    self.job.is_none(),
+                                )
+                                .clicked()
+                            {
+                                self.tab += 1;
+                            }
+                        });
+                    });
             });
+        egui::Window::new("Guide & glossary").open(&mut self.show_help).default_width(510.).max_height(ctx.screen_rect().height() - 130.).vscroll(true).resizable(false).show(ctx, |ui| {
+            ui.heading("Four steps to shape your sound");
+            ui.label("1. Set up your microphone and signal route, or import an existing Dirac Live project.");
+            ui.label("2. Measure point 1 at your main seat. Each action captures left, then right. Move to the surrounding high and low sofa positions only after both responses are saved.");
+            ui.label("3. Preview a sound preset and apply it. Start with bass-only correction; review the boost limit.");
+            ui.label("4. Export the target to Dirac Live, or calculate a FIR for a software convolver.");
+            ui.separator();
+            for (term, meaning) in [("Target curve", "The frequency balance you want. It is a goal, not a measurement of the corrected room."), ("Hz · frequency", "Low frequencies are bass. Higher frequencies are mids and treble."), ("dB · relative level", "A higher value asks for more sound at that frequency. These graphs do not show calibrated loudness."), ("Correction range", "The part of the frequency spectrum the filter is allowed to change."), ("Maximum boost", "How much the filter can raise a weak frequency. A limit can keep deep dips below the target."), ("Included take", "A saved measurement used in the average. Excluded takes stay saved for review."), ("FIR / convolver", "A filter file and the software that applies it during playback.")] {
+                ui.label(RichText::new(term).strong()); ui.label(meaning);
+            }
+            ui.hyperlink_to("Dirac Live manual ↗", "https://helpdesk.dirac.com/en/dirac-live/Dirac-Live-User-Manual-1eb2");
         });
     }
 }
@@ -1114,10 +1515,24 @@ fn selector(
 }
 fn speaker_selector(ui: &mut egui::Ui, ch: &mut usize, max: usize) {
     egui::ComboBox::from_id_salt("speaker")
-        .selected_text(format!("Speaker {}", *ch + 1))
+        .selected_text(speaker_name(*ch))
         .show_ui(ui, |ui| {
             for i in 0..=max.min(63) {
-                ui.selectable_value(ch, i, format!("Speaker {}", i + 1));
+                ui.selectable_value(ch, i, speaker_name(i));
             }
         });
+}
+
+fn speaker_name(channel: usize) -> String {
+    match channel {
+        0 => "Left speaker".into(),
+        1 => "Right speaker".into(),
+        _ => format!("Speaker {}", channel + 1),
+    }
+}
+
+fn physical_channel(ui: &mut egui::Ui, label: &str, channel: &mut usize) {
+    ui.label(label);
+    let mut displayed = *channel + 1;
+    if ui.add(egui::DragValue::new(&mut displayed).range(1..=64)).on_hover_text("Channel numbers start at 1. A mono microphone usually uses 1; stereo outputs usually use 1 for left and 2 for right. Check your interface routing.").changed() { *channel = displayed - 1; }
 }

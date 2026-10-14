@@ -3,7 +3,7 @@ set -eu
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$project_dir"
 cargo build --release --locked
-app_dir="$project_dir/dist/OpenRoom.app"
+app_dir="$project_dir/dist/OpenWave.app"
 mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources"
 build_dir=${CARGO_TARGET_DIR:-target}
 cp "$build_dir/release/open-room" "$app_dir/Contents/MacOS/open-room"

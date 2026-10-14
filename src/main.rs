@@ -122,7 +122,11 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Command::Discover) => {
-            println!("{}", serde_json::to_string_pretty(&device::discover()?)?);
+            let report = device::discover_report()?;
+            for warning in report.warnings {
+                eprintln!("{warning}");
+            }
+            println!("{}", serde_json::to_string_pretty(&report.devices)?);
             Ok(())
         }
         Some(Command::Probe { address }) => {
